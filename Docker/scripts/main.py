@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""
-make_fake_slowlog.py - generate fake rows for the `mysql_slowlog` table.
+"""Generate fake rows for a MySQL `mysql_slowlog` table.
 
-    python -m pip install faker
-    python make_fake_slowlog.py                        # 10,000 rows
-    python make_fake_slowlog.py --rows 50000 --seed 7 --out-dir out
+The rows are spread across five fake databases (shop_prod, billing_prod, analytics_dw,
+inventory_prod and crm_prod), each with its own tables and application accounts.
 
-Writes two files next to the script (or into --out-dir):
-    mysql_slowlog_fake.sql   INSERT statements, 500 rows per statement
+Usage:
+    pip install -r requirements.txt
+    python main.py                                       # 10,000 rows
+    python main.py --rows 50000 --seed 7 --out-dir out
+
+Output (next to this script, or in --out-dir):
+    mysql_slowlog_fake.sql   INSERT statements in one transaction (INSERT_BATCH rows each)
     mysql_slowlog_fake.csv   the same rows with a header line
 
-`id` is left out on purpose so AUTO_INCREMENT numbers the rows. Rows are written in
-start_time order, so ids climb with time like in a real log. The same --seed gives
-the same queries; start_time is anchored to the moment you run the script.
+The `id` column is left out on purpose so AUTO_INCREMENT numbers the rows. Rows are written
+in start_time order, so ids climb with time like in a real log. The same --seed gives the
+same queries; start_time is anchored to the moment the script runs.
 """
 import argparse
 import csv
@@ -32,7 +35,7 @@ from faker import Faker
 # =============================================================================
 NUM_ROWS = 10_000
 SEED = 42
-DAYS_BACK = 30          # start_time is spread over the last 30 days
+DAYS_BACK = 30          # start_time is spread over this many past days
 INSERT_BATCH = 500      # rows per INSERT statement in the .sql file
 
 MIN_QUERY_TIME = 0.50   # hard floor: nothing faster than this ever appears
@@ -53,15 +56,17 @@ fake = Faker("en_US")          # all fake-looking values: emails, names, cities,
 # Small helpers
 # =============================================================================
 def q(text):
-    """Quote text as a MySQL string literal (backslashes and single quotes escaped)."""
+    """Quote `text` as a MySQL string literal, escaping backslashes and single quotes."""
     return "'" + str(text).replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 def fmt_dt(dt):
+    """Format a datetime as 'YYYY-MM-DD HH:MM:SS'."""
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def fmt_day(dt):
+    """Format a datetime as 'YYYY-MM-DD'."""
     return dt.strftime("%Y-%m-%d")
 
 
@@ -76,40 +81,60 @@ def fmt_day(dt):
 #   status     lifecycle state (choices are in forward order, e.g. pending -> paid)
 #   category   fixed set of labels (used for GROUP BY / filters)
 #   email, first_name, last_name, city, company, code, word, path    searchable text
+#
+# Adding a database? The templates pick tables by shape, so each database needs:
+#   - an "id" column and at least two other columns in every table
+#   - a purge=True table that has a "ts" column
+#   - a table with "money", "ts" and "fk" columns
+#   - a table with searchable text and a "ts" column
+#   - a child -> parent link where the child has "ts" and "status" columns and the
+#     parent has searchable text
+#   - a link whose parent has a "ts" column
+#   - a table with a "ts" column and two parents that each have a "status" or "category"
+#     column
 # =============================================================================
 TEXT_KINDS = ("email", "first_name", "last_name", "city", "company", "code", "word", "path")
 
 
 @dataclass(frozen=True)
 class Col:
+    """One column of a fake table. `kind` says what the column holds (see the notes above)."""
+
     name: str
     kind: str
     choices: tuple = ()   # allowed values for status/category; a bothify pattern for 'code'
 
 
 def C(name, kind, *choices):
+    """Shorthand for Col(name, kind, choices), to keep the table definitions compact."""
     return Col(name, kind, choices)
 
 
 @dataclass(frozen=True)
 class Table:
+    """A fake table: its columns, and whether archive jobs purge old rows from it."""
+
     name: str
     cols: tuple
     purge: bool = False   # log-style table that archive jobs DELETE from
 
     def of(self, *kinds):
-        """All columns whose kind is one of `kinds`."""
+        """Return all columns whose kind is one of `kinds`."""
         return [c for c in self.cols if c.kind in kinds]
 
     def col(self, name):
+        """Return the column called `name`."""
         return next(c for c in self.cols if c.name == name)
 
     @property
     def pk(self):
+        """Return the primary-key column (the table's first "id" column)."""
         return self.of("id")[0]
 
 
 class Rel(NamedTuple):
+    """A foreign-key link: `child.fk` points at `parent.pk`."""
+
     child: Table
     fk: Col               # foreign-key column on the child
     parent: Table         # fk joins to parent.pk
@@ -117,6 +142,8 @@ class Rel(NamedTuple):
 
 @dataclass(frozen=True)
 class Database:
+    """A fake database: its tables, the links between them, and who queries it."""
+
     name: str
     weight: int           # share of the slow queries that hit this database
     users: tuple          # (main application account, secondary reporting account)
@@ -124,10 +151,12 @@ class Database:
     rels: tuple
 
     def parents_of(self, table):
+        """Return the links from `table` to the tables it references."""
         return [r for r in self.rels if r.child is table]
 
 
 def make_db(name, weight, users, tables, fks):
+    """Build a Database. `fks` holds (child_table, fk_column, parent_table) names."""
     by_name = {t.name: t for t in tables}
     rels = tuple(Rel(by_name[c], by_name[c].col(fk), by_name[p]) for c, fk, p in fks)
     return Database(name, weight, users, tuple(tables), rels)
@@ -135,7 +164,7 @@ def make_db(name, weight, users, tables, fks):
 
 # --- 1. Online store ---------------------------------------------------------
 SHOP_PROD = make_db(
-    "shop_prod", 55, ("app_user", "report_user"),
+    "shop_prod", 40, ("app_user", "report_user"),
     tables=[
         Table("customers", (
             C("customer_id", "id"), C("email", "email"),
@@ -176,7 +205,7 @@ SHOP_PROD = make_db(
 
 # --- 2. SaaS subscription billing -------------------------------------------
 BILLING_PROD = make_db(
-    "billing_prod", 20, ("billing_svc", "report_user"),
+    "billing_prod", 15, ("billing_svc", "report_user"),
     tables=[
         Table("accounts", (
             C("account_id", "id"), C("company_name", "company"), C("billing_email", "email"),
@@ -217,7 +246,7 @@ BILLING_PROD = make_db(
 
 # --- 3. Marketing / web analytics warehouse ---------------------------------
 ANALYTICS_DW = make_db(
-    "analytics_dw", 25, ("etl_user", "bi_reader"),
+    "analytics_dw", 20, ("etl_user", "bi_reader"),
     tables=[
         Table("campaigns", (
             C("campaign_id", "id"), C("campaign_name", "word"),
@@ -248,7 +277,93 @@ ANALYTICS_DW = make_db(
          ("conversions", "campaign_id", "campaigns")],
 )
 
-DATABASES = [SHOP_PROD, BILLING_PROD, ANALYTICS_DW]
+# --- 4. Warehouse inventory and purchasing ----------------------------------
+INVENTORY_PROD = make_db(
+    "inventory_prod", 15, ("wms_app", "report_user"),
+    tables=[
+        Table("warehouses", (
+            C("warehouse_id", "id"), C("warehouse_name", "word"), C("city", "city"),
+            C("region", "category", "us_east", "us_central", "us_west", "emea", "apac"),
+            C("opened_at", "ts"),
+        )),
+        Table("suppliers", (
+            C("supplier_id", "id"), C("company_name", "company"), C("contact_email", "email"),
+            C("country_code", "category", "US", "MX", "CN", "DE", "VN", "IN"),
+            C("created_at", "ts"),
+            C("status", "status", "pending", "approved", "on_hold", "terminated"),
+        )),
+        Table("stock_items", (
+            C("item_id", "id"), C("sku", "code", "???-#####"), C("item_name", "word"),
+            C("category", "category", "electronics", "home_garden", "apparel", "toys",
+              "sports", "beauty", "books", "grocery"),
+            C("unit_cost", "money"), C("reorder_level", "qty"), C("created_at", "ts"),
+            C("status", "status", "active", "low_stock", "out_of_stock", "discontinued"),
+        )),
+        Table("purchase_orders", (
+            C("po_id", "id"), C("supplier_id", "fk"), C("warehouse_id", "fk"),
+            C("po_number", "code", "PO-2026-######"),
+            C("total_cost", "money"), C("ordered_at", "ts"), C("expected_at", "ts"),
+            C("status", "status", "draft", "submitted", "confirmed", "shipped",
+              "received", "closed"),
+        )),
+        Table("stock_movements", (
+            C("movement_id", "id"), C("item_id", "fk"), C("warehouse_id", "fk"),
+            C("movement_type", "category", "receipt", "pick", "transfer", "adjustment",
+              "return"),
+            C("quantity", "qty"), C("moved_at", "ts"),
+        ), purge=True),
+    ],
+    fks=[("purchase_orders", "supplier_id", "suppliers"),
+         ("purchase_orders", "warehouse_id", "warehouses"),
+         ("stock_movements", "item_id", "stock_items"),
+         ("stock_movements", "warehouse_id", "warehouses")],
+)
+
+# --- 5. Sales CRM and customer support --------------------------------------
+CRM_PROD = make_db(
+    "crm_prod", 10, ("crm_app", "report_user"),
+    tables=[
+        Table("contacts", (
+            C("contact_id", "id"), C("email", "email"),
+            C("first_name", "first_name"), C("last_name", "last_name"),
+            C("company_name", "company"), C("city", "city"),
+            C("created_at", "ts"), C("last_contacted_at", "ts"),
+            C("lead_status", "status", "new", "contacted", "qualified", "customer", "churned"),
+        )),
+        Table("staff", (
+            C("staff_id", "id"), C("first_name", "first_name"), C("last_name", "last_name"),
+            C("team", "category", "sales", "support", "success", "billing"),
+            C("hired_at", "ts"),
+        )),
+        Table("deals", (
+            C("deal_id", "id"), C("contact_id", "fk"), C("owner_id", "fk"),
+            C("amount", "money"),
+            C("stage", "status", "prospecting", "qualified", "proposal", "negotiation",
+              "won", "lost"),
+            C("created_at", "ts"), C("expected_close_at", "ts"),
+        )),
+        Table("tickets", (
+            C("ticket_id", "id"), C("contact_id", "fk"), C("assignee_id", "fk"),
+            C("subject", "word"),
+            C("priority", "category", "low", "normal", "high", "urgent"),
+            C("status", "status", "open", "pending", "on_hold", "resolved", "closed"),
+            C("created_at", "ts"), C("updated_at", "ts"),
+        )),
+        Table("activities", (
+            C("activity_id", "id"), C("contact_id", "fk"), C("staff_id", "fk"),
+            C("activity_type", "category", "call", "email", "meeting", "note", "task"),
+            C("logged_at", "ts"),
+        ), purge=True),
+    ],
+    fks=[("deals", "contact_id", "contacts"),
+         ("deals", "owner_id", "staff"),
+         ("tickets", "contact_id", "contacts"),
+         ("tickets", "assignee_id", "staff"),
+         ("activities", "contact_id", "contacts"),
+         ("activities", "staff_id", "staff")],
+)
+
+DATABASES = [SHOP_PROD, BILLING_PROD, ANALYTICS_DW, INVENTORY_PROD, CRM_PROD]
 
 
 # =============================================================================
@@ -256,12 +371,14 @@ DATABASES = [SHOP_PROD, BILLING_PROD, ANALYTICS_DW]
 # =============================================================================
 @dataclass
 class Ctx:
+    """Per-query context handed to every template."""
+
     start: datetime       # when this query ran; dates inside the SQL are chosen relative to it
     examined: int         # roughly how many rows the query should look like it scanned
 
 
 def literal(col, ctx):
-    """A realistic SQL literal for a column of this kind (quoted when it needs to be)."""
+    """Return a realistic SQL literal for `col` (quoted when its kind needs quotes)."""
     k = col.kind
     if k in ("id", "fk"):
         return str(rng.randint(1_000, 4_800_000))
@@ -292,7 +409,7 @@ def literal(col, ctx):
 
 
 def search_term(col):
-    """A fragment someone might type into a search box for this column."""
+    """Return a fragment someone might type into a search box for `col`."""
     k = col.kind
     if k == "email":
         return fake.last_name().lower()
@@ -312,7 +429,7 @@ def search_term(col):
 
 
 def window_start(ctx, days):
-    """Cutoff `days` before the query ran, written as a date literal or as NOW() - INTERVAL."""
+    """Return a cutoff `days` before the query ran, as a date literal or NOW() - INTERVAL."""
     if rng.random() < 0.5:
         return f"NOW() - INTERVAL {days} DAY"
     cutoff = (ctx.start - timedelta(days=days)).replace(hour=0, minute=0, second=0)
@@ -320,14 +437,14 @@ def window_start(ctx, days):
 
 
 def date_window(ctx, days):
-    """(first, last) strings covering the `days` days before the query ran."""
+    """Return (first, last) date strings covering the `days` days before the query ran."""
     first = fmt_day(ctx.start - timedelta(days=days))
     last = fmt_day(ctx.start - timedelta(days=1)) + " 23:59:59"
     return first, last
 
 
 def condition(ref, col, ctx):
-    """One plausible WHERE predicate for `ref` (the column, possibly alias-qualified)."""
+    """Return one plausible WHERE predicate on `col`; `ref` is how the SQL names that column."""
     k = col.kind
     if k in ("status", "category"):
         if rng.random() < 0.6:
@@ -344,7 +461,7 @@ def condition(ref, col, ctx):
 
 
 def select_list(table):
-    """`*` about a third of the time, otherwise the PK plus a few other columns of the table."""
+    """Return a SELECT list: `*` 30% of the time, otherwise the PK plus 2-4 other columns."""
     if rng.random() < 0.3:
         return "*"
     others = [c for c in table.cols if c is not table.pk]
@@ -353,8 +470,11 @@ def select_list(table):
 
 
 def aliases(*tables):
-    """Table aliases for multi-table queries. Hand-written SQL uses short aliases (o, oi, c);
-    ORM-generated SQL repeats the full table name. Both show up in real slow logs."""
+    """Return one alias per table for a multi-table query.
+
+    Hand-written SQL uses short aliases (o, oi, c); ORM-generated SQL repeats the full
+    table name. Both show up in real slow logs.
+    """
     if rng.random() < 0.4:
         return [t.name for t in tables]
     used, result = set(), []
@@ -367,19 +487,22 @@ def aliases(*tables):
 
 
 def from_item(table, alias):
+    """Return a FROM/JOIN item: the bare table name, or "table alias" when aliased."""
     return table.name if alias == table.name else f"{table.name} {alias}"
 
 
 def pick_table(db, wanted):
+    """Return a random table of `db` for which `wanted(table)` is true."""
     return rng.choice([t for t in db.tables if wanted(t)])
 
 
 def pick_rel(db, wanted):
+    """Return a random foreign-key link of `db` for which `wanted(rel)` is true."""
     return rng.choice([r for r in db.rels if wanted(r)])
 
 
 # =============================================================================
-# The 10 query templates. Each returns (sql_text, rows_sent).
+# The 10 query templates. Each takes (db, ctx) and returns (sql_text, rows_sent).
 # =============================================================================
 def like_search(db, ctx):
     """Leading-wildcard LIKE on a text column. No index can help, so MySQL scans the table."""
@@ -541,6 +664,8 @@ def archive_delete(db, ctx):
 
 
 class Template(NamedTuple):
+    """A query template and how often it shows up in the log."""
+
     name: str
     weight: int           # relative frequency in the log
     build: Callable
@@ -565,6 +690,8 @@ TEMPLATES = [
 # Row generation
 # =============================================================================
 class Row(NamedTuple):
+    """One generated slow-log row."""
+
     start_time: datetime
     query_time_seconds: float
     lock_time_seconds: float
@@ -577,7 +704,7 @@ class Row(NamedTuple):
 
 
 def draw_query_time():
-    """0.5 s floor plus a log-normal tail; anything above MAX_QUERY_TIME is re-drawn."""
+    """Return a query time: a MIN_QUERY_TIME floor plus a log-normal tail, capped by re-drawing."""
     while True:
         t = MIN_QUERY_TIME + rng.lognormvariate(TAIL_MU, TAIL_SIGMA)
         if t <= MAX_QUERY_TIME:
@@ -585,7 +712,7 @@ def draw_query_time():
 
 
 def draw_lock_time(query_time, lock_prone):
-    """Lock_time is usually near zero; writes sometimes sit waiting on another transaction."""
+    """Return a lock time: usually near zero, but writes (`lock_prone`) often wait on locks."""
     if rng.random() < (0.30 if lock_prone else 0.01):
         lock = rng.uniform(0.2, 0.9) * query_time
     elif rng.random() < 0.15:
@@ -596,12 +723,14 @@ def draw_lock_time(query_time, lock_prone):
 
 
 def draw_start_time(now):
+    """Return a timestamp within the last DAYS_BACK days, weighted toward busy hours."""
     day = now - timedelta(days=rng.randint(1, DAYS_BACK))
     hour = rng.choices(range(24), weights=HOUR_WEIGHTS)[0]
     return day.replace(hour=hour, minute=rng.randint(0, 59), second=rng.randint(0, 59), microsecond=0)
 
 
 def make_row(now, app_ips):
+    """Build one slow-log row: pick a database and a query template, then draw its timings."""
     db = rng.choices(DATABASES, weights=[d.weight for d in DATABASES])[0]
     tpl = rng.choices(TEMPLATES, weights=[t.weight for t in TEMPLATES])[0]
     start = draw_start_time(now)
@@ -618,6 +747,7 @@ def make_row(now, app_ips):
 
 
 def generate(n, seed):
+    """Return `n` rows sorted by start_time. The same seed repeats the same queries."""
     rng.seed(seed)
     Faker.seed(seed)
     now = datetime.now().replace(microsecond=0)
@@ -628,6 +758,7 @@ def generate(n, seed):
 
 
 def check(rows):
+    """Assert the timing rules hold: query_time within bounds, lock <= query, examined >= sent."""
     assert all(r.query_time_seconds >= MIN_QUERY_TIME for r in rows), "query_time below floor"
     assert all(r.query_time_seconds <= MAX_QUERY_TIME for r in rows), "query_time above ceiling"
     assert all(r.lock_time_seconds <= r.query_time_seconds for r in rows), "lock_time > query_time"
@@ -642,11 +773,13 @@ COLUMNS = ["start_time", "query_time_seconds", "lock_time_seconds", "rows_sent",
 
 
 def as_fields(r):
+    """Return a row's values in COLUMNS order (shared by the CSV and SQL writers)."""
     return [fmt_dt(r.start_time), f"{r.query_time_seconds:.2f}", f"{r.lock_time_seconds:.2f}",
             r.rows_sent, r.rows_examined, r.db_name, r.user_host, r.sql_text]
 
 
 def write_csv(rows, path):
+    """Write `rows` to `path` as CSV with a header line."""
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(COLUMNS)
@@ -654,6 +787,7 @@ def write_csv(rows, path):
 
 
 def write_sql(rows, path):
+    """Write `rows` to `path` as batched INSERT statements inside one transaction."""
     head = f"INSERT INTO mysql_slowlog ({', '.join(COLUMNS)}) VALUES\n"
     with path.open("w", encoding="utf-8", newline="\n") as f:
         f.write("START TRANSACTION;\n")
@@ -668,9 +802,11 @@ def write_sql(rows, path):
 
 
 def summarize(rows):
+    """Print query-time percentiles plus row counts per database and per template."""
     times = sorted(r.query_time_seconds for r in rows)
 
     def pct(p):
+        """Return the query time at quantile `p` (0 to 1)."""
         return times[min(len(times) - 1, int(p * len(times)))]
 
     print(f"query_time_seconds: min {times[0]:.2f} | median {pct(0.5):.2f} | "
@@ -681,10 +817,14 @@ def summarize(rows):
 
 
 def main():
+    """Parse the command line, generate the rows, and write the .sql and .csv files."""
     parser = argparse.ArgumentParser(description="Generate fake rows for the mysql_slowlog table.")
-    parser.add_argument("--rows", type=int, default=NUM_ROWS)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--rows", type=int, default=NUM_ROWS,
+                        help="number of rows to generate (default: %(default)s)")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help="seed for repeatable queries (default: %(default)s)")
+    parser.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent,
+                        help="output folder (default: the folder containing this script)")
     args = parser.parse_args()
 
     rows = generate(args.rows, args.seed)

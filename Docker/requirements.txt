@@ -1,1 +1,3 @@
-faker
+# Pinned to an exact version on purpose: Faker's data changes between releases, so a given
+# --seed only reproduces the same rows on the same Faker version.
+faker==40.39.0
