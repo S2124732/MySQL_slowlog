@@ -1,28 +1,35 @@
 # MySQL Slowlog_Generator
 This project was created as a way to easily generate sample MySQL slowlog data to mimic a production environment.
 Data is designed to be used for project work like analytics or building out sample pipelines.
-Docker is used here as a way to isolate resources in the event you want to produce lots of rows.
+Docker is used here so you don't need Python or Faker installed on your machine, and so everyone
+gets the same Python and Faker versions (which matters for getting the same rows from the same seed).
 
 ## Sample Output
 
-CSV:
+Example rows from a run with the default seed (`--seed 42`), copied straight from the generated files.
+The full files contain 10,000 rows. Start times, and the date ranges inside some queries, are relative
+to the day you run the script, so the dates in your output will differ from these.
+
+CSV (`mysql_slowlog_fake.csv`):
 
 ```text
-start_time	    query_time_seconds	lock_time_seconds	rows_sent	rows_examined	db_name	        user_host	                          sql_text
-9/13/2026 0:21	0.81	            0.04	            50	        55105	        billing_prod	billing_svc[billing_svc] @ 10.0.3.9	  SELECT account_id, plan_tier, status FROM accounts WHERE status = 'suspended' ORDER BY created_at DESC LIMIT 50 OFFSET 55050
-9/13/2026 0:45	0.89	            0.02	            5	        46312	        shop_prod	    app_user[app_user] @ 10.0.3.9	      SELECT o.order_status, COUNT(*) AS num_rows, SUM(oi.unit_price) AS total FROM order_items oi JOIN orders o ON o.order_id = oi.order_id JOIN products p ON p.product_id = oi.product_id WHERE oi.created_at BETWEEN '2026-09-06' AND '2026-09-12 23:59:59' AND p.category = 'apparel' GROUP BY o.order_status HAVING COUNT(*) > 10 ORDER BY total DESC LIMIT 20
-9/13/2026 1:00	2.54	            0.04	            58	        170554	        shop_prod	    app_user[app_user] @ 10.0.6.57	      SELECT DATE(created_at) AS day, COUNT(*) AS cnt, SUM(unit_price) AS total, ROUND(AVG(unit_price), 2) AS avg_value FROM order_items WHERE created_at BETWEEN '2026-07-15' AND '2026-09-12 23:59:59' GROUP BY DATE(created_at) ORDER BY day
+start_time,query_time_seconds,lock_time_seconds,rows_sent,rows_examined,db_name,user_host,sql_text
+...
+2026-09-16 00:46:54,1.39,0.02,200,33125,billing_prod,report_user[report_user] @ 10.0.3.9,"SELECT subscriptions.subscription_id, subscriptions.monthly_price, subscriptions.started_at, accounts.company_name, accounts.billing_email FROM subscriptions INNER JOIN accounts ON accounts.account_id = subscriptions.account_id WHERE subscriptions.status = 'canceled' AND subscriptions.renews_at >= NOW() - INTERVAL 14 DAY ORDER BY subscriptions.monthly_price DESC LIMIT 200"
+2026-09-16 01:13:47,2.59,0.04,12,128241,shop_prod,app_user[app_user] @ 10.0.35.109,"SELECT DATE(created_at) AS day, COUNT(*) AS cnt, SUM(total_amount) AS total, ROUND(AVG(total_amount), 2) AS avg_value FROM orders WHERE created_at BETWEEN '2026-09-02' AND '2026-09-15 23:59:59' GROUP BY DATE(created_at) ORDER BY day"
+2026-09-16 01:38:41,3.35,0.01,0,491192,shop_prod,app_user[app_user] @ 10.0.38.110,DELETE FROM login_attempts WHERE attempted_at < NOW() - INTERVAL 30 DAY LIMIT 5000
 ...
 ```
 
-SQL:
+SQL (`mysql_slowlog_fake.sql`):
 
 ```sql
 START TRANSACTION;
 INSERT INTO mysql_slowlog (start_time, query_time_seconds, lock_time_seconds, rows_sent, rows_examined, db_name, user_host, sql_text) VALUES
-('2026-09-13 00:21:21', 0.81, 0.04, 50, 55105, 'billing_prod', 'billing_svc[billing_svc] @ 10.0.3.9', 'SELECT account_id, plan_tier, status FROM accounts WHERE status = ''suspended'' ORDER BY created_at DESC LIMIT 50 OFFSET 55050'),
-('2026-09-13 00:45:45', 0.89, 0.02, 5, 46312, 'shop_prod', 'app_user[app_user] @ 10.0.3.9', 'SELECT o.order_status, COUNT(*) AS num_rows, SUM(oi.unit_price) AS total FROM order_items oi JOIN orders o ON o.order_id = oi.order_id JOIN products p ON p.product_id = oi.product_id WHERE oi.created_at BETWEEN ''2026-09-06'' AND ''2026-09-12 23:59:59'' AND p.category = ''apparel'' GROUP BY o.order_status HAVING COUNT(*) > 10 ORDER BY total DESC LIMIT 20'),
-('2026-09-13 01:00:52', 2.54, 0.04, 58, 170554, 'shop_prod', 'app_user[app_user] @ 10.0.6.57', 'SELECT DATE(created_at) AS day, COUNT(*) AS cnt, SUM(unit_price) AS total, ROUND(AVG(unit_price), 2) AS avg_value FROM order_items WHERE created_at BETWEEN ''2026-07-15'' AND ''2026-09-12 23:59:59'' GROUP BY DATE(created_at) ORDER BY day'),
+...
+('2026-09-16 00:46:54', 1.39, 0.02, 200, 33125, 'billing_prod', 'report_user[report_user] @ 10.0.3.9', 'SELECT subscriptions.subscription_id, subscriptions.monthly_price, subscriptions.started_at, accounts.company_name, accounts.billing_email FROM subscriptions INNER JOIN accounts ON accounts.account_id = subscriptions.account_id WHERE subscriptions.status = ''canceled'' AND subscriptions.renews_at >= NOW() - INTERVAL 14 DAY ORDER BY subscriptions.monthly_price DESC LIMIT 200'),
+('2026-09-16 01:13:47', 2.59, 0.04, 12, 128241, 'shop_prod', 'app_user[app_user] @ 10.0.35.109', 'SELECT DATE(created_at) AS day, COUNT(*) AS cnt, SUM(total_amount) AS total, ROUND(AVG(total_amount), 2) AS avg_value FROM orders WHERE created_at BETWEEN ''2026-09-02'' AND ''2026-09-15 23:59:59'' GROUP BY DATE(created_at) ORDER BY day'),
+('2026-09-16 01:38:41', 3.35, 0.01, 0, 491192, 'shop_prod', 'app_user[app_user] @ 10.0.38.110', 'DELETE FROM login_attempts WHERE attempted_at < NOW() - INTERVAL 30 DAY LIMIT 5000'),
 ...
 COMMIT;
 ```
@@ -44,6 +51,9 @@ Rows are spread across five fake databases (the `db_name` column), each with its
 The build step is identical in every shell. The run step differs only in how the current folder is written in the `-v` option: `${PWD}\output` in PowerShell, `$(pwd)/output` in bash.
 
 ### 1. Build the image
+
+This image uses BuildKit's `RUN --mount` (see the `Dockerfile`), so you need Docker Engine 23.0 or later,
+or a current Docker Desktop. Older Docker versions fail with an error about `--mount`.
 
 Clone this repo, then run this from the project directory (the one that contains the `Docker` folder):
 
